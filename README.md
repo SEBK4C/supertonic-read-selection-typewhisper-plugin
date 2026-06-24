@@ -51,6 +51,10 @@ git push origin v1.0.0
 
 The GitHub Actions release workflow builds `dist/SupertonicReadSelectionPlugin.zip` on macOS and attaches it to the release.
 
+## Future Development
+
+Future Codex sessions should read `docs/CODEX_TYPEWHISPER_PLUGIN_CHEATSHEET.md` before changing packaging, manifests, principal classes, or release automation.
+
 ## Read-Aloud Behavior
 
 The plugin listens for the configured shortcut directly. Pick a shortcut that does not conflict with the apps you use most often, because the plugin observes the shortcut globally but does not reserve it away from the foreground app. When triggered, it first asks macOS Accessibility for the focused app's selected text. If that is unavailable, it briefly sends Command-C, reads the copied text, and restores your clipboard snapshot.
