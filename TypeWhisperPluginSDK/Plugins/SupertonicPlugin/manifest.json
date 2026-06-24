@@ -1,0 +1,27 @@
+{
+    "id": "com.sebk4c.typewhisper.tts.supertonic-read-selection",
+    "name": "Supertonic Read Selection",
+    "version": "1.0.0",
+    "minHostVersion": "1.4.0",
+    "sdkCompatibilityVersion": "v1",
+    "minOSVersion": "14.0",
+    "supportedArchitectures": [
+        "arm64"
+    ],
+    "author": "SEBK4C",
+    "description": "Experimental local text-to-speech with Supertonic 3 ONNX models. Includes a plugin-owned shortcut and workflow action for reading selected text aloud. Requires accepting the OpenRAIL-M model license before downloading model assets.",
+    "descriptions": {
+        "de": "Experimentelles lokales Text-to-Speech mit Supertonic-3-ONNX-Modellen sowie plugin-eigener Tastenkombination und Workflow-Aktion zum Vorlesen markierten Textes. Vor dem Download der Modellassets muss die OpenRAIL-M-Modelllizenz akzeptiert werden.",
+        "ja": "Supertonic 3 ONNXモデルによる実験的なローカル音声合成です。選択テキストを読み上げるプラグイン独自のショートカットとワークフローアクションを提供します。モデルアセットのダウンロード前にOpenRAIL-Mモデルライセンスへの同意が必要です。"
+    },
+    "category": "tts",
+    "categories": [
+        "tts",
+        "action"
+    ],
+    "hosting": "local",
+    "iconSystemName": "waveform.circle.fill",
+    "principalClass": "SupertonicSelectionReaderPlugin",
+    "requiresAPIKey": false,
+    "detailsURL": "https://www.typewhisper.com/addons/supertonic/"
+}
