@@ -368,6 +368,7 @@ private final class SupertonicTextToSpeech {
             totalSteps,
             speed: speed,
             silenceDuration: silenceDuration,
+            maxBatchSize: inferenceBatchSize,
             prioritizeFirstUtterance: false
         ) { samples, duration in
             combinedWav.append(contentsOf: samples)
@@ -393,6 +394,7 @@ private final class SupertonicTextToSpeech {
             totalSteps,
             speed: speed,
             silenceDuration: silenceDuration,
+            maxBatchSize: 1,
             prioritizeFirstUtterance: true
         ) { samples, _ in
             onAudio(samples)
@@ -406,6 +408,7 @@ private final class SupertonicTextToSpeech {
         _ totalSteps: Int,
         speed: Float,
         silenceDuration: Float,
+        maxBatchSize: Int,
         prioritizeFirstUtterance: Bool,
         onAudio: ([Float], Float) throws -> Bool
     ) throws {
@@ -415,7 +418,7 @@ private final class SupertonicTextToSpeech {
             ? supertonicPromoteFirstUtterance(baseChunks, maxLength: chunkLength)
             : baseChunks
         let languageList = Array(repeating: language, count: chunks.count)
-        let batchSize = max(1, min(inferenceBatchSize, chunks.count))
+        let batchSize = max(1, min(maxBatchSize, chunks.count))
         let firstBatchSize = prioritizeFirstUtterance && chunks.count > 1 ? 1 : batchSize
         supertonicRuntimeLogger.info("Processing Supertonic chunks count=\(chunks.count, privacy: .public) batchSize=\(batchSize, privacy: .public) firstBatchSize=\(firstBatchSize, privacy: .public)")
         if prioritizeFirstUtterance {

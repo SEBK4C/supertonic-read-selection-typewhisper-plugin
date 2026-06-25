@@ -9,6 +9,10 @@ import os
 enum SupertonicDefaultsKey {
     static let selectedVoiceId = "selectedVoiceId"
     static let speed = "speed"
+    static let playbackRate = "playbackRate"
+    static let playbackPitchSemitones = "playbackPitchSemitones"
+    static let lowPassEnabled = "lowPassEnabled"
+    static let lowPassCutoff = "lowPassCutoff"
     static let quality = "quality"
     static let inferenceBackend = "inferenceBackend"
     static let readAloudShortcut = "readAloudShortcut"
@@ -62,6 +66,45 @@ enum SupertonicModelState: Equatable, Sendable {
 struct SupertonicSynthesisOutput: Sendable {
     let samples: [Float]
     let sampleRate: Int
+}
+
+struct SupertonicPlaybackSettings: Equatable, Sendable {
+    static let defaultRate = 1.0
+    static let defaultPitchSemitones = 0.0
+    static let defaultLowPassCutoff = 9_000.0
+
+    let rate: Double
+    let pitchSemitones: Double
+    let lowPassEnabled: Bool
+    let lowPassCutoff: Double
+
+    var pitchCents: Double {
+        pitchSemitones * 100
+    }
+
+    init(
+        rate: Double = Self.defaultRate,
+        pitchSemitones: Double = Self.defaultPitchSemitones,
+        lowPassEnabled: Bool = false,
+        lowPassCutoff: Double = Self.defaultLowPassCutoff
+    ) {
+        self.rate = Self.clampedRate(rate)
+        self.pitchSemitones = Self.clampedPitchSemitones(pitchSemitones)
+        self.lowPassEnabled = lowPassEnabled
+        self.lowPassCutoff = Self.clampedLowPassCutoff(lowPassCutoff)
+    }
+
+    static func clampedRate(_ value: Double) -> Double {
+        min(max(value, 1.0), 4.0)
+    }
+
+    static func clampedPitchSemitones(_ value: Double) -> Double {
+        min(max(value, -6.0), 6.0)
+    }
+
+    static func clampedLowPassCutoff(_ value: Double) -> Double {
+        min(max(value, 4_000), 12_000)
+    }
 }
 
 struct SupertonicShortcut: Equatable, Sendable {
@@ -215,8 +258,8 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
     private var host: HostServices?
     private let synthesizerLock = NSLock()
     private var synthesizer: (any SupertonicSynthesizing)?
-    private var playbackSessionFactory: @Sendable ([Float], Int) throws -> any TTSPlaybackSession = { samples, sampleRate in
-        try SupertonicPlaybackSession(samples: samples, sampleRate: sampleRate)
+    private var playbackSessionFactory: @Sendable ([Float], Int, SupertonicPlaybackSettings) throws -> any TTSPlaybackSession = { samples, sampleRate, playbackSettings in
+        try SupertonicPlaybackSession(samples: samples, sampleRate: sampleRate, playbackSettings: playbackSettings)
     }
     private let actionPlaybackLock = NSLock()
     private var actionPlaybackSession: (any TTSPlaybackSession)?
@@ -263,8 +306,36 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
     }
 
     var selectedSpeed: Double {
-        let raw = host?.userDefault(forKey: SupertonicDefaultsKey.speed) as? Double ?? 1.05
+        let raw = host?.userDefault(forKey: SupertonicDefaultsKey.speed) as? Double ?? 1.0
         return Self.clampedSpeed(raw)
+    }
+
+    var selectedPlaybackRate: Double {
+        let raw = host?.userDefault(forKey: SupertonicDefaultsKey.playbackRate) as? Double ?? 1.0
+        return SupertonicPlaybackSettings.clampedRate(raw)
+    }
+
+    var selectedPlaybackPitchSemitones: Double {
+        let raw = host?.userDefault(forKey: SupertonicDefaultsKey.playbackPitchSemitones) as? Double ?? SupertonicPlaybackSettings.defaultPitchSemitones
+        return SupertonicPlaybackSettings.clampedPitchSemitones(raw)
+    }
+
+    var selectedLowPassEnabled: Bool {
+        host?.userDefault(forKey: SupertonicDefaultsKey.lowPassEnabled) as? Bool ?? false
+    }
+
+    var selectedLowPassCutoff: Double {
+        let raw = host?.userDefault(forKey: SupertonicDefaultsKey.lowPassCutoff) as? Double ?? SupertonicPlaybackSettings.defaultLowPassCutoff
+        return SupertonicPlaybackSettings.clampedLowPassCutoff(raw)
+    }
+
+    var selectedPlaybackSettings: SupertonicPlaybackSettings {
+        SupertonicPlaybackSettings(
+            rate: selectedPlaybackRate,
+            pitchSemitones: selectedPlaybackPitchSemitones,
+            lowPassEnabled: selectedLowPassEnabled,
+            lowPassCutoff: selectedLowPassCutoff
+        )
     }
 
     var selectedQuality: SupertonicQuality {
@@ -290,7 +361,7 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
     var settingsSummary: String? {
         let voice = selectedVoiceId ?? "M1"
         let shortcut = selectedReadAloudShortcut?.displayName ?? "Not Set"
-        return "Voice: \(voice) - Speed: \(String(format: "%.2fx", selectedSpeed)) - \(selectedQuality.displayName) - \(selectedInferenceBackend.displayName) - Shortcut: \(shortcut)"
+        return "Voice: \(voice) - Generation: \(String(format: "%.2fx", selectedSpeed)) - Playback: \(String(format: "%.2fx", selectedPlaybackRate)) - \(selectedQuality.displayName) - \(selectedInferenceBackend.displayName) - Shortcut: \(shortcut)"
     }
 
     var downloadedModels: [PluginModelInfo] {
@@ -353,6 +424,22 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
         host?.setUserDefault(Self.clampedSpeed(speed), forKey: SupertonicDefaultsKey.speed)
     }
 
+    func setPlaybackRate(_ playbackRate: Double) {
+        host?.setUserDefault(SupertonicPlaybackSettings.clampedRate(playbackRate), forKey: SupertonicDefaultsKey.playbackRate)
+    }
+
+    func setPlaybackPitchSemitones(_ pitchSemitones: Double) {
+        host?.setUserDefault(SupertonicPlaybackSettings.clampedPitchSemitones(pitchSemitones), forKey: SupertonicDefaultsKey.playbackPitchSemitones)
+    }
+
+    func setLowPassEnabled(_ enabled: Bool) {
+        host?.setUserDefault(enabled, forKey: SupertonicDefaultsKey.lowPassEnabled)
+    }
+
+    func setLowPassCutoff(_ cutoff: Double) {
+        host?.setUserDefault(SupertonicPlaybackSettings.clampedLowPassCutoff(cutoff), forKey: SupertonicDefaultsKey.lowPassCutoff)
+    }
+
     func setQuality(_ quality: SupertonicQuality) {
         host?.setUserDefault(quality.rawValue, forKey: SupertonicDefaultsKey.quality)
     }
@@ -369,6 +456,20 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
         Task { @MainActor [weak self] in
             self?.refreshShortcutMonitors()
         }
+    }
+
+    func playSettingsPreview() async throws {
+        stopActionPlaybackIfActive()
+        let session = try await speak(TTSSpeakRequest(
+            text: "This is a Supertonic playback test. Tune the speed, pitch, and cleanup filter until this voice sounds clear.",
+            language: "en",
+            purpose: .manualReadback
+        ))
+        setActionPlaybackSession(session)
+    }
+
+    func stopSettingsPreview() {
+        stopActionPlaybackIfActive()
     }
 
     func acceptCurrentModelLicense(now: Date = Date()) {
@@ -471,12 +572,13 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
         let language = SupertonicLanguageResolver.normalizedLanguageCode(for: request.language)
         let quality = selectedQuality
         let speed = selectedSpeed
+        let playbackSettings = selectedPlaybackSettings
         let synthesizer = try await Task.detached(priority: .userInitiated) { [self] in
             try synthesizerForCurrentModel()
         }.value
 
         if let streamingSynthesizer = synthesizer as? any SupertonicStreamingSynthesizing {
-            let session = try SupertonicStreamingPlaybackSession(sampleRate: streamingSynthesizer.sampleRate)
+            let session = try SupertonicStreamingPlaybackSession(sampleRate: streamingSynthesizer.sampleRate, playbackSettings: playbackSettings)
             Task.detached(priority: .userInitiated) { [logger] in
                 do {
                     try streamingSynthesizer.synthesizeStreaming(
@@ -507,12 +609,12 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
             )
         }.value
 
-        return try playbackSessionFactory(output.samples, output.sampleRate)
+        return try playbackSessionFactory(output.samples, output.sampleRate, playbackSettings)
     }
 
     func configureSynthesisForTesting(
         synthesizer: any SupertonicSynthesizing,
-        playbackSessionFactory: @escaping @Sendable ([Float], Int) throws -> any TTSPlaybackSession
+        playbackSessionFactory: @escaping @Sendable ([Float], Int, SupertonicPlaybackSettings) throws -> any TTSPlaybackSession
     ) {
         synthesizerLock.lock()
         self.synthesizer = synthesizer
@@ -788,7 +890,11 @@ private struct SupertonicSettingsView: View {
 
     @State private var acceptedLicense = false
     @State private var selectedVoiceId = "M1"
-    @State private var speed = 1.05
+    @State private var speed = 1.0
+    @State private var playbackRate = 1.0
+    @State private var playbackPitchSemitones = 0.0
+    @State private var lowPassEnabled = false
+    @State private var lowPassCutoff = SupertonicPlaybackSettings.defaultLowPassCutoff
     @State private var quality: SupertonicQuality = .balanced
     @State private var useCoreMLGPU = false
     @State private var modelState: SupertonicModelState = .notDownloaded
@@ -799,6 +905,8 @@ private struct SupertonicSettingsView: View {
     @State private var isValidatingToken = false
     @State private var tokenValidationResult: Bool?
     @State private var isDownloading = false
+    @State private var isStartingPreview = false
+    @State private var previewError: String?
 
     private let pollTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
@@ -822,6 +930,10 @@ private struct SupertonicSettingsView: View {
             Divider()
 
             voiceSection
+
+            Divider()
+
+            playbackSection
 
             Divider()
 
@@ -939,9 +1051,9 @@ private struct SupertonicSettingsView: View {
             }
 
             HStack {
-                Text("Speed", bundle: bundle)
+                Text("Generation Speed", bundle: bundle)
                 Spacer()
-                Text(speed, format: .number.precision(.fractionLength(2)))
+                Text("\(speed, specifier: "%.2f")x")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
@@ -959,6 +1071,87 @@ private struct SupertonicSettingsView: View {
             }
             .onChange(of: quality) { _, newValue in
                 plugin.setQuality(newValue)
+            }
+        }
+    }
+
+    private var playbackSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Playback", bundle: bundle)
+                .font(.subheadline)
+                .fontWeight(.medium)
+
+            HStack {
+                Text("Speed", bundle: bundle)
+                Spacer()
+                Text("\(playbackRate, specifier: "%.2f")x")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+
+            Slider(value: $playbackRate, in: 1.0...4.0, step: 0.05)
+                .onChange(of: playbackRate) { _, newValue in
+                    plugin.setPlaybackRate(newValue)
+                }
+
+            HStack {
+                Text("Pitch", bundle: bundle)
+                Spacer()
+                Text("\(playbackPitchSemitones, specifier: "%+.2f") st")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+
+            Slider(value: $playbackPitchSemitones, in: -6.0...6.0, step: 0.25)
+                .onChange(of: playbackPitchSemitones) { _, newValue in
+                    plugin.setPlaybackPitchSemitones(newValue)
+                }
+
+            Toggle(isOn: $lowPassEnabled) {
+                Text("Low-Pass Cleanup", bundle: bundle)
+            }
+            .onChange(of: lowPassEnabled) { _, newValue in
+                plugin.setLowPassEnabled(newValue)
+            }
+
+            HStack {
+                Text("Cutoff", bundle: bundle)
+                Spacer()
+                Text("\(lowPassCutoff / 1_000, specifier: "%.1f") kHz")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+
+            Slider(value: $lowPassCutoff, in: 4_000...12_000, step: 250)
+                .disabled(!lowPassEnabled)
+                .onChange(of: lowPassCutoff) { _, newValue in
+                    plugin.setLowPassCutoff(newValue)
+                }
+
+            HStack {
+                Button {
+                    startPreview()
+                } label: {
+                    Label(String(localized: "Test Playback", bundle: bundle), systemImage: "play.fill")
+                }
+                .disabled(isStartingPreview || modelState != .ready)
+
+                Button {
+                    plugin.stopSettingsPreview()
+                } label: {
+                    Label(String(localized: "Stop", bundle: bundle), systemImage: "stop.fill")
+                }
+                .disabled(modelState != .ready)
+            }
+            .controlSize(.small)
+
+            if let previewError {
+                Label(previewError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
         }
     }
@@ -1090,10 +1283,32 @@ private struct SupertonicSettingsView: View {
         }
     }
 
+    private func startPreview() {
+        isStartingPreview = true
+        previewError = nil
+        Task {
+            do {
+                try await plugin.playSettingsPreview()
+                await MainActor.run {
+                    isStartingPreview = false
+                }
+            } catch {
+                await MainActor.run {
+                    isStartingPreview = false
+                    previewError = error.localizedDescription
+                }
+            }
+        }
+    }
+
     private func refreshFromPlugin() {
         acceptedLicense = plugin.hasAcceptedCurrentModelLicense
         selectedVoiceId = plugin.selectedVoiceId ?? "M1"
         speed = plugin.selectedSpeed
+        playbackRate = plugin.selectedPlaybackRate
+        playbackPitchSemitones = plugin.selectedPlaybackPitchSemitones
+        lowPassEnabled = plugin.selectedLowPassEnabled
+        lowPassCutoff = plugin.selectedLowPassCutoff
         quality = plugin.selectedQuality
         useCoreMLGPU = plugin.selectedInferenceBackend == .coreMLGPU
         modelState = plugin.modelState

@@ -16,6 +16,8 @@ final class SupertonicPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
 
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    private let timePitch = AVAudioUnitTimePitch()
+    private let cleanupEQ = AVAudioUnitEQ(numberOfBands: 1)
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     var isActive: Bool {
@@ -35,7 +37,7 @@ final class SupertonicPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
         }
     }
 
-    init(samples: [Float], sampleRate: Int) throws {
+    init(samples: [Float], sampleRate: Int, playbackSettings: SupertonicPlaybackSettings = SupertonicPlaybackSettings()) throws {
         guard let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Double(sampleRate),
@@ -46,7 +48,13 @@ final class SupertonicPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
         }
 
         engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
+        engine.attach(timePitch)
+        engine.attach(cleanupEQ)
+        configureEffects(playbackSettings)
+        engine.connect(player, to: timePitch, format: format)
+        engine.connect(timePitch, to: cleanupEQ, format: format)
+        engine.connect(cleanupEQ, to: engine.mainMixerNode, format: format)
+        logPlaybackSettings(prefix: "Configured Supertonic playback")
 
         guard !samples.isEmpty,
               let buffer = AVAudioPCMBuffer(
@@ -80,6 +88,8 @@ final class SupertonicPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
         player.stop()
         engine.stop()
         engine.detach(player)
+        engine.detach(timePitch)
+        engine.detach(cleanupEQ)
         onFinish?()
     }
 
@@ -90,6 +100,26 @@ final class SupertonicPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
             return state.onFinish
         }
         callback?()
+    }
+
+    private func configureEffects(_ settings: SupertonicPlaybackSettings) {
+        timePitch.rate = Float(settings.rate)
+        timePitch.pitch = Float(settings.pitchCents)
+        configureLowPass(settings)
+    }
+
+    private func configureLowPass(_ settings: SupertonicPlaybackSettings) {
+        guard let band = cleanupEQ.bands.first else { return }
+        band.filterType = .lowPass
+        band.frequency = Float(settings.lowPassCutoff)
+        band.bandwidth = 0.7
+        band.gain = 0
+        band.bypass = !settings.lowPassEnabled
+    }
+
+    private func logPlaybackSettings(prefix: String) {
+        let band = cleanupEQ.bands.first
+        supertonicPlaybackLogger.info("\(prefix, privacy: .public) rate=\(Double(self.timePitch.rate), privacy: .public)x pitch=\(Double(self.timePitch.pitch), privacy: .public)c lowPassEnabled=\(!(band?.bypass ?? true), privacy: .public) lowPassCutoff=\(Double(band?.frequency ?? 0), privacy: .public)Hz")
     }
 }
 
@@ -103,6 +133,8 @@ final class SupertonicStreamingPlaybackSession: TTSPlaybackSession, @unchecked S
 
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    private let timePitch = AVAudioUnitTimePitch()
+    private let cleanupEQ = AVAudioUnitEQ(numberOfBands: 1)
     private let format: AVAudioFormat
     private let state = OSAllocatedUnfairLock(initialState: State())
 
@@ -123,7 +155,7 @@ final class SupertonicStreamingPlaybackSession: TTSPlaybackSession, @unchecked S
         }
     }
 
-    init(sampleRate: Int) throws {
+    init(sampleRate: Int, playbackSettings: SupertonicPlaybackSettings = SupertonicPlaybackSettings()) throws {
         guard let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Double(sampleRate),
@@ -135,7 +167,13 @@ final class SupertonicStreamingPlaybackSession: TTSPlaybackSession, @unchecked S
 
         self.format = format
         engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
+        engine.attach(timePitch)
+        engine.attach(cleanupEQ)
+        configureEffects(playbackSettings)
+        engine.connect(player, to: timePitch, format: format)
+        engine.connect(timePitch, to: cleanupEQ, format: format)
+        engine.connect(cleanupEQ, to: engine.mainMixerNode, format: format)
+        logPlaybackSettings(prefix: "Configured Supertonic streaming playback")
         try engine.start()
         player.play()
     }
@@ -188,6 +226,8 @@ final class SupertonicStreamingPlaybackSession: TTSPlaybackSession, @unchecked S
         player.stop()
         engine.stop()
         engine.detach(player)
+        engine.detach(timePitch)
+        engine.detach(cleanupEQ)
         callback()
     }
 
@@ -211,6 +251,26 @@ final class SupertonicStreamingPlaybackSession: TTSPlaybackSession, @unchecked S
             return state.onFinish
         }
         callback?()
+    }
+
+    private func configureEffects(_ settings: SupertonicPlaybackSettings) {
+        timePitch.rate = Float(settings.rate)
+        timePitch.pitch = Float(settings.pitchCents)
+        configureLowPass(settings)
+    }
+
+    private func configureLowPass(_ settings: SupertonicPlaybackSettings) {
+        guard let band = cleanupEQ.bands.first else { return }
+        band.filterType = .lowPass
+        band.frequency = Float(settings.lowPassCutoff)
+        band.bandwidth = 0.7
+        band.gain = 0
+        band.bypass = !settings.lowPassEnabled
+    }
+
+    private func logPlaybackSettings(prefix: String) {
+        let band = cleanupEQ.bands.first
+        supertonicPlaybackLogger.info("\(prefix, privacy: .public) rate=\(Double(self.timePitch.rate), privacy: .public)x pitch=\(Double(self.timePitch.pitch), privacy: .public)c lowPassEnabled=\(!(band?.bypass ?? true), privacy: .public) lowPassCutoff=\(Double(band?.frequency ?? 0), privacy: .public)Hz")
     }
 
     private static func makeBuffer(samples: [Float], format: AVAudioFormat) -> AVAudioPCMBuffer? {

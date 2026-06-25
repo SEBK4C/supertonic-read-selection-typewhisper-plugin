@@ -76,31 +76,48 @@ final class SupertonicPluginTests: XCTestCase {
         XCTAssertFalse(plugin.canDownloadModel)
     }
 
-    func testSelectVoiceSpeedQualityAndInferenceBackendPersistChoices() throws {
+    func testSelectVoiceSpeedPlaybackDSPQualityAndInferenceBackendPersistChoices() throws {
         let host = try PluginTestHostServices()
         let plugin = SupertonicPlugin()
         plugin.activate(host: host)
 
         plugin.selectVoice("F1")
         plugin.setSpeed(1.35)
+        plugin.setPlaybackRate(2.25)
+        plugin.setPlaybackPitchSemitones(-1.5)
+        plugin.setLowPassEnabled(true)
+        plugin.setLowPassCutoff(7_500)
         plugin.setQuality(.high)
         plugin.setInferenceBackend(.coreMLGPU)
 
         XCTAssertEqual(plugin.selectedVoiceId, "F1")
         XCTAssertEqual(plugin.selectedSpeed, 1.35, accuracy: 0.001)
+        XCTAssertEqual(plugin.selectedPlaybackRate, 2.25, accuracy: 0.001)
+        XCTAssertEqual(plugin.selectedPlaybackPitchSemitones, -1.5, accuracy: 0.001)
+        XCTAssertEqual(plugin.selectedLowPassEnabled, true)
+        XCTAssertEqual(plugin.selectedLowPassCutoff, 7_500, accuracy: 0.001)
         XCTAssertEqual(plugin.selectedQuality, .high)
         XCTAssertEqual(plugin.selectedInferenceBackend, .coreMLGPU)
         XCTAssertEqual(host.userDefault(forKey: "selectedVoiceId") as? String, "F1")
         XCTAssertEqual(host.userDefault(forKey: "speed") as? Double, 1.35)
+        XCTAssertEqual(host.userDefault(forKey: "playbackRate") as? Double, 2.25)
+        XCTAssertEqual(host.userDefault(forKey: "playbackPitchSemitones") as? Double, -1.5)
+        XCTAssertEqual(host.userDefault(forKey: "lowPassEnabled") as? Bool, true)
+        XCTAssertEqual(host.userDefault(forKey: "lowPassCutoff") as? Double, 7_500)
         XCTAssertEqual(host.userDefault(forKey: "quality") as? String, "high")
         XCTAssertEqual(host.userDefault(forKey: "inferenceBackend") as? String, "coreMLGPU")
     }
 
-    func testInferenceBackendDefaultsToCPU() throws {
+    func testPlaybackAndInferenceDefaults() throws {
         let host = try PluginTestHostServices()
         let plugin = SupertonicPlugin()
         plugin.activate(host: host)
 
+        XCTAssertEqual(plugin.selectedSpeed, 1.0)
+        XCTAssertEqual(plugin.selectedPlaybackRate, 1.0)
+        XCTAssertEqual(plugin.selectedPlaybackPitchSemitones, 0.0)
+        XCTAssertEqual(plugin.selectedLowPassEnabled, false)
+        XCTAssertEqual(plugin.selectedLowPassCutoff, 9_000)
         XCTAssertEqual(plugin.selectedInferenceBackend, .cpu)
     }
 
@@ -150,13 +167,17 @@ final class SupertonicPluginTests: XCTestCase {
         try installModelFixtures(in: host.pluginDataDirectory)
         let plugin = SupertonicPlugin()
         plugin.activate(host: host)
+        plugin.setPlaybackRate(2.0)
+        plugin.setPlaybackPitchSemitones(-1.25)
+        plugin.setLowPassEnabled(true)
+        plugin.setLowPassCutoff(8_000)
 
         let synthesizer = RecordingSupertonicSynthesizer()
         let sessionFactory = PlaybackSessionFactorySpy()
         plugin.configureSynthesisForTesting(
             synthesizer: synthesizer,
-            playbackSessionFactory: { samples, sampleRate in
-                try sessionFactory.make(samples: samples, sampleRate: sampleRate)
+            playbackSessionFactory: { samples, sampleRate, playbackSettings in
+                try sessionFactory.make(samples: samples, sampleRate: sampleRate, playbackSettings: playbackSettings)
             }
         )
 
@@ -172,6 +193,10 @@ final class SupertonicPluginTests: XCTestCase {
         XCTAssertEqual(synthesizer.lastRequest?.language, "de")
         XCTAssertEqual(synthesizer.lastRequest?.voiceId, "M1")
         XCTAssertEqual(sessionFactory.latestSession?.isActive, true)
+        XCTAssertEqual(sessionFactory.latestSession?.playbackSettings.rate ?? 0, 2.0, accuracy: 0.001)
+        XCTAssertEqual(sessionFactory.latestSession?.playbackSettings.pitchSemitones ?? 0, -1.25, accuracy: 0.001)
+        XCTAssertEqual(sessionFactory.latestSession?.playbackSettings.lowPassEnabled, true)
+        XCTAssertEqual(sessionFactory.latestSession?.playbackSettings.lowPassCutoff ?? 0, 8_000, accuracy: 0.001)
     }
 
     func testReadSelectionActionFallsBackToOriginalText() async throws {
@@ -184,8 +209,8 @@ final class SupertonicPluginTests: XCTestCase {
         let sessionFactory = PlaybackSessionFactorySpy()
         plugin.configureSynthesisForTesting(
             synthesizer: synthesizer,
-            playbackSessionFactory: { samples, sampleRate in
-                try sessionFactory.make(samples: samples, sampleRate: sampleRate)
+            playbackSessionFactory: { samples, sampleRate, playbackSettings in
+                try sessionFactory.make(samples: samples, sampleRate: sampleRate, playbackSettings: playbackSettings)
             }
         )
 
@@ -207,8 +232,8 @@ final class SupertonicPluginTests: XCTestCase {
         let sessionFactory = PlaybackSessionFactorySpy()
         plugin.configureSynthesisForTesting(
             synthesizer: synthesizer,
-            playbackSessionFactory: { samples, sampleRate in
-                try sessionFactory.make(samples: samples, sampleRate: sampleRate)
+            playbackSessionFactory: { samples, sampleRate, playbackSettings in
+                try sessionFactory.make(samples: samples, sampleRate: sampleRate, playbackSettings: playbackSettings)
             }
         )
 
@@ -288,8 +313,8 @@ private final class PlaybackSessionFactorySpy: @unchecked Sendable {
         return sessions.last
     }
 
-    func make(samples: [Float], sampleRate: Int) throws -> any TTSPlaybackSession {
-        let session = TestPlaybackSession(samples: samples, sampleRate: sampleRate)
+    func make(samples: [Float], sampleRate: Int, playbackSettings: SupertonicPlaybackSettings) throws -> any TTSPlaybackSession {
+        let session = TestPlaybackSession(samples: samples, sampleRate: sampleRate, playbackSettings: playbackSettings)
         lock.lock()
         sessions.append(session)
         lock.unlock()
@@ -300,15 +325,17 @@ private final class PlaybackSessionFactorySpy: @unchecked Sendable {
 private final class TestPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
     let samples: [Float]
     let sampleRate: Int
+    let playbackSettings: SupertonicPlaybackSettings
 
     private let lock = NSLock()
     private var active = true
     private var finishHandler: (@Sendable () -> Void)?
     private(set) var stopCount = 0
 
-    init(samples: [Float], sampleRate: Int) {
+    init(samples: [Float], sampleRate: Int, playbackSettings: SupertonicPlaybackSettings) {
         self.samples = samples
         self.sampleRate = sampleRate
+        self.playbackSettings = playbackSettings
     }
 
     var isActive: Bool {
