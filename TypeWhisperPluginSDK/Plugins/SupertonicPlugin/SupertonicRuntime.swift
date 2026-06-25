@@ -7,6 +7,8 @@ private let supertonicRuntimeLogger = Logger(
     category: "Runtime"
 )
 
+private let supertonicMaxPredictedChunkDuration: Float = 90
+
 final class SupertonicONNXSynthesizer: SupertonicStreamingSynthesizing, @unchecked Sendable {
     private let textToSpeech: SupertonicTextToSpeech
     private let voiceStylesDirectory: URL
@@ -560,6 +562,7 @@ private final class SupertonicTextToSpeech {
         for index in duration.indices {
             duration[index] /= speed
         }
+        try supertonicValidatePredictedDurations(duration)
 
         let textEncoderOutputs = try textEncoder.run(
             withInputs: ["text_ids": textIdsValue, "style_ttl": styleTTL, "text_mask": textMaskValue],
@@ -699,6 +702,21 @@ private enum SupertonicORT {
         }
 
         return result
+    }
+}
+
+private func supertonicValidatePredictedDurations(_ durations: [Float]) throws {
+    guard !durations.isEmpty else {
+        throw SupertonicPluginError.invalidSynthesisOutput
+    }
+
+    for duration in durations {
+        guard duration.isFinite,
+              duration > 0,
+              duration <= supertonicMaxPredictedChunkDuration else {
+            supertonicRuntimeLogger.error("Rejected invalid Supertonic predicted duration=\(Double(duration), privacy: .public)s")
+            throw SupertonicPluginError.invalidSynthesisOutput
+        }
     }
 }
 

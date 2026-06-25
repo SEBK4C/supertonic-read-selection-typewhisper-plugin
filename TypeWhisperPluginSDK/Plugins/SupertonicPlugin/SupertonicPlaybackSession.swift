@@ -8,6 +8,21 @@ private let supertonicPlaybackLogger = Logger(
     category: "Playback"
 )
 
+private func configureBand(
+    _ band: AVAudioUnitEQFilterParameters,
+    type: AVAudioUnitEQFilterType,
+    frequency: Double,
+    gain: Double,
+    bandwidth: Double,
+    bypass: Bool
+) {
+    band.filterType = type
+    band.frequency = Float(frequency)
+    band.gain = Float(gain)
+    band.bandwidth = Float(bandwidth)
+    band.bypass = bypass
+}
+
 final class SupertonicPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
     private struct State {
         var isActive = true
@@ -17,7 +32,7 @@ final class SupertonicPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let timePitch = AVAudioUnitTimePitch()
-    private let cleanupEQ = AVAudioUnitEQ(numberOfBands: 1)
+    private let cleanupEQ = AVAudioUnitEQ(numberOfBands: 4)
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     var isActive: Bool {
@@ -105,21 +120,48 @@ final class SupertonicPlaybackSession: TTSPlaybackSession, @unchecked Sendable {
     private func configureEffects(_ settings: SupertonicPlaybackSettings) {
         timePitch.rate = Float(settings.rate)
         timePitch.pitch = Float(settings.pitchCents)
-        configureLowPass(settings)
+        timePitch.overlap = Float(settings.timePitchOverlap)
+        configureEQ(settings)
     }
 
-    private func configureLowPass(_ settings: SupertonicPlaybackSettings) {
-        guard let band = cleanupEQ.bands.first else { return }
-        band.filterType = .lowPass
-        band.frequency = Float(settings.lowPassCutoff)
-        band.bandwidth = 0.7
-        band.gain = 0
-        band.bypass = !settings.lowPassEnabled
+    private func configureEQ(_ settings: SupertonicPlaybackSettings) {
+        guard cleanupEQ.bands.count >= 4 else { return }
+        configureBand(
+            cleanupEQ.bands[0],
+            type: .lowPass,
+            frequency: settings.lowPassCutoff,
+            gain: 0,
+            bandwidth: 0.7,
+            bypass: !settings.lowPassEnabled
+        )
+        configureBand(
+            cleanupEQ.bands[1],
+            type: .parametric,
+            frequency: settings.resonanceEQFrequency,
+            gain: settings.resonanceEQGain,
+            bandwidth: settings.resonanceEQBandwidth,
+            bypass: !settings.resonanceEQEnabled
+        )
+        configureBand(
+            cleanupEQ.bands[2],
+            type: .highShelf,
+            frequency: settings.clarityFrequency,
+            gain: settings.clarityGain,
+            bandwidth: 1.0,
+            bypass: !settings.clarityEnabled
+        )
+        configureBand(
+            cleanupEQ.bands[3],
+            type: .parametric,
+            frequency: settings.sibilanceFrequency,
+            gain: settings.sibilanceGain,
+            bandwidth: settings.sibilanceBandwidth,
+            bypass: !settings.sibilanceTamerEnabled
+        )
     }
 
     private func logPlaybackSettings(prefix: String) {
-        let band = cleanupEQ.bands.first
-        supertonicPlaybackLogger.info("\(prefix, privacy: .public) rate=\(Double(self.timePitch.rate), privacy: .public)x pitch=\(Double(self.timePitch.pitch), privacy: .public)c lowPassEnabled=\(!(band?.bypass ?? true), privacy: .public) lowPassCutoff=\(Double(band?.frequency ?? 0), privacy: .public)Hz")
+        supertonicPlaybackLogger.info("\(prefix, privacy: .public) rate=\(Double(self.timePitch.rate), privacy: .public)x pitch=\(Double(self.timePitch.pitch), privacy: .public)c overlap=\(Double(self.timePitch.overlap), privacy: .public)")
     }
 }
 
@@ -134,7 +176,7 @@ final class SupertonicStreamingPlaybackSession: TTSPlaybackSession, @unchecked S
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let timePitch = AVAudioUnitTimePitch()
-    private let cleanupEQ = AVAudioUnitEQ(numberOfBands: 1)
+    private let cleanupEQ = AVAudioUnitEQ(numberOfBands: 4)
     private let format: AVAudioFormat
     private let state = OSAllocatedUnfairLock(initialState: State())
 
@@ -256,21 +298,48 @@ final class SupertonicStreamingPlaybackSession: TTSPlaybackSession, @unchecked S
     private func configureEffects(_ settings: SupertonicPlaybackSettings) {
         timePitch.rate = Float(settings.rate)
         timePitch.pitch = Float(settings.pitchCents)
-        configureLowPass(settings)
+        timePitch.overlap = Float(settings.timePitchOverlap)
+        configureEQ(settings)
     }
 
-    private func configureLowPass(_ settings: SupertonicPlaybackSettings) {
-        guard let band = cleanupEQ.bands.first else { return }
-        band.filterType = .lowPass
-        band.frequency = Float(settings.lowPassCutoff)
-        band.bandwidth = 0.7
-        band.gain = 0
-        band.bypass = !settings.lowPassEnabled
+    private func configureEQ(_ settings: SupertonicPlaybackSettings) {
+        guard cleanupEQ.bands.count >= 4 else { return }
+        configureBand(
+            cleanupEQ.bands[0],
+            type: .lowPass,
+            frequency: settings.lowPassCutoff,
+            gain: 0,
+            bandwidth: 0.7,
+            bypass: !settings.lowPassEnabled
+        )
+        configureBand(
+            cleanupEQ.bands[1],
+            type: .parametric,
+            frequency: settings.resonanceEQFrequency,
+            gain: settings.resonanceEQGain,
+            bandwidth: settings.resonanceEQBandwidth,
+            bypass: !settings.resonanceEQEnabled
+        )
+        configureBand(
+            cleanupEQ.bands[2],
+            type: .highShelf,
+            frequency: settings.clarityFrequency,
+            gain: settings.clarityGain,
+            bandwidth: 1.0,
+            bypass: !settings.clarityEnabled
+        )
+        configureBand(
+            cleanupEQ.bands[3],
+            type: .parametric,
+            frequency: settings.sibilanceFrequency,
+            gain: settings.sibilanceGain,
+            bandwidth: settings.sibilanceBandwidth,
+            bypass: !settings.sibilanceTamerEnabled
+        )
     }
 
     private func logPlaybackSettings(prefix: String) {
-        let band = cleanupEQ.bands.first
-        supertonicPlaybackLogger.info("\(prefix, privacy: .public) rate=\(Double(self.timePitch.rate), privacy: .public)x pitch=\(Double(self.timePitch.pitch), privacy: .public)c lowPassEnabled=\(!(band?.bypass ?? true), privacy: .public) lowPassCutoff=\(Double(band?.frequency ?? 0), privacy: .public)Hz")
+        supertonicPlaybackLogger.info("\(prefix, privacy: .public) rate=\(Double(self.timePitch.rate), privacy: .public)x pitch=\(Double(self.timePitch.pitch), privacy: .public)c overlap=\(Double(self.timePitch.overlap), privacy: .public)")
     }
 
     private static func makeBuffer(samples: [Float], format: AVAudioFormat) -> AVAudioPCMBuffer? {

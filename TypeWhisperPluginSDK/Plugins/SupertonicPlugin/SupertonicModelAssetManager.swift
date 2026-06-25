@@ -13,6 +13,7 @@ enum SupertonicPluginError: LocalizedError, Equatable {
     case licenseNotAccepted
     case incompleteModelAssets
     case invalidDownloadResponse
+    case invalidSynthesisOutput
     case playbackUnavailable
     case emptyText
 
@@ -26,6 +27,8 @@ enum SupertonicPluginError: LocalizedError, Equatable {
             return "The downloaded Supertonic model cache is incomplete."
         case .invalidDownloadResponse:
             return "Supertonic model download returned an invalid response."
+        case .invalidSynthesisOutput:
+            return "Supertonic generated invalid audio metadata."
         case .playbackUnavailable:
             return "Supertonic audio playback could not be started."
         case .emptyText:
