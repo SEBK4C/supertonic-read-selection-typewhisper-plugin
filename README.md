@@ -39,14 +39,20 @@ Then restart TypeWhisper.
 
 Open the plugin settings to accept the Supertonic 3 model license, download the model assets, choose a voice, and record the Read Selection Shortcut.
 
+## Performance
+
+Supertonic Read Selection can optionally run ONNX Runtime through Core ML with CPU and GPU compute units on Apple silicon Macs. Enable Use Mac GPU (Core ML) in the plugin settings to try the accelerated backend. If Core ML cannot load the model, the plugin falls back to CPU inference.
+
+For long selections, the plugin splits text into paragraph and sentence-aware chunks, batches later chunks together for throughput, and streams audio to one serialized player as each chunk finishes. The first utterance is prioritized as its own small batch so speech can begin quickly, then the remaining chunks continue in larger batches.
+
 ## Release
 
 Add a screenshot at `docs/screenshots/settings.png` if you want it included in the GitHub release notes, then tag the release:
 
 ```sh
-git tag v1.0.0
+git tag v1.1.0
 git push origin main
-git push origin v1.0.0
+git push origin v1.1.0
 ```
 
 The GitHub Actions release workflow builds `dist/SupertonicReadSelectionPlugin.zip` on macOS and attaches it to the release.

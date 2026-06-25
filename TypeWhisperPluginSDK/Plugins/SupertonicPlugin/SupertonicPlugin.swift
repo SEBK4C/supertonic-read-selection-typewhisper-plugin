@@ -10,6 +10,7 @@ enum SupertonicDefaultsKey {
     static let selectedVoiceId = "selectedVoiceId"
     static let speed = "speed"
     static let quality = "quality"
+    static let inferenceBackend = "inferenceBackend"
     static let readAloudShortcut = "readAloudShortcut"
     static let hfToken = "hf-token"
     static let acceptedModelLicenseId = "acceptedModelLicenseId"
@@ -35,6 +36,18 @@ enum SupertonicQuality: String, CaseIterable, Sendable {
         case .fast: "Fast"
         case .balanced: "Balanced"
         case .high: "High"
+        }
+    }
+}
+
+enum SupertonicInferenceBackend: String, CaseIterable, Sendable {
+    case cpu
+    case coreMLGPU
+
+    var displayName: String {
+        switch self {
+        case .cpu: "CPU"
+        case .coreMLGPU: "Mac GPU"
         }
     }
 }
@@ -179,6 +192,19 @@ protocol SupertonicSynthesizing: AnyObject, Sendable {
     ) throws -> SupertonicSynthesisOutput
 }
 
+protocol SupertonicStreamingSynthesizing: SupertonicSynthesizing {
+    var sampleRate: Int { get }
+
+    func synthesizeStreaming(
+        text: String,
+        language: String,
+        voiceId: String,
+        quality: SupertonicQuality,
+        speed: Double,
+        onAudio: @escaping @Sendable ([Float]) -> Bool
+    ) throws
+}
+
 @objc(SupertonicSelectionReaderPlugin)
 final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginSettingsActivityReporting, PluginDownloadedModelManaging, @unchecked Sendable {
     static let pluginId = "com.sebk4c.typewhisper.tts.supertonic-read-selection"
@@ -249,6 +275,14 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
         return .balanced
     }
 
+    var selectedInferenceBackend: SupertonicInferenceBackend {
+        if let raw = host?.userDefault(forKey: SupertonicDefaultsKey.inferenceBackend) as? String,
+           let backend = SupertonicInferenceBackend(rawValue: raw) {
+            return backend
+        }
+        return .cpu
+    }
+
     var selectedReadAloudShortcut: SupertonicShortcut? {
         SupertonicShortcut(storageValue: host?.userDefault(forKey: SupertonicDefaultsKey.readAloudShortcut) as? String)
     }
@@ -256,7 +290,7 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
     var settingsSummary: String? {
         let voice = selectedVoiceId ?? "M1"
         let shortcut = selectedReadAloudShortcut?.displayName ?? "Not Set"
-        return "Voice: \(voice) - Speed: \(String(format: "%.2fx", selectedSpeed)) - \(selectedQuality.displayName) - Shortcut: \(shortcut)"
+        return "Voice: \(voice) - Speed: \(String(format: "%.2fx", selectedSpeed)) - \(selectedQuality.displayName) - \(selectedInferenceBackend.displayName) - Shortcut: \(shortcut)"
     }
 
     var downloadedModels: [PluginModelInfo] {
@@ -321,6 +355,13 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
 
     func setQuality(_ quality: SupertonicQuality) {
         host?.setUserDefault(quality.rawValue, forKey: SupertonicDefaultsKey.quality)
+    }
+
+    func setInferenceBackend(_ backend: SupertonicInferenceBackend) {
+        guard selectedInferenceBackend != backend else { return }
+        host?.setUserDefault(backend.rawValue, forKey: SupertonicDefaultsKey.inferenceBackend)
+        clearSynthesizerCache()
+        host?.notifyCapabilitiesChanged()
     }
 
     func setReadAloudShortcut(_ shortcut: SupertonicShortcut?) {
@@ -430,9 +471,34 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
         let language = SupertonicLanguageResolver.normalizedLanguageCode(for: request.language)
         let quality = selectedQuality
         let speed = selectedSpeed
+        let synthesizer = try await Task.detached(priority: .userInitiated) { [self] in
+            try synthesizerForCurrentModel()
+        }.value
 
-        let output = try await Task.detached(priority: .userInitiated) { [self] in
-            try synthesizerForCurrentModel().synthesize(
+        if let streamingSynthesizer = synthesizer as? any SupertonicStreamingSynthesizing {
+            let session = try SupertonicStreamingPlaybackSession(sampleRate: streamingSynthesizer.sampleRate)
+            Task.detached(priority: .userInitiated) { [logger] in
+                do {
+                    try streamingSynthesizer.synthesizeStreaming(
+                        text: text,
+                        language: language,
+                        voiceId: voiceId,
+                        quality: quality,
+                        speed: speed
+                    ) { samples in
+                        session.append(samples: samples)
+                    }
+                    session.finishInput()
+                } catch {
+                    logger.error("Supertonic streaming synthesis failed: \(error.localizedDescription)")
+                    session.finishInput()
+                }
+            }
+            return session
+        }
+
+        let output = try await Task.detached(priority: .userInitiated) {
+            try synthesizer.synthesize(
                 text: text,
                 language: language,
                 voiceId: voiceId,
@@ -468,7 +534,16 @@ final class SupertonicPlugin: NSObject, TTSProviderPlugin, ActionPlugin, PluginS
         if let synthesizer {
             return synthesizer
         }
-        let synthesizer = try SupertonicONNXSynthesizer(modelDirectory: modelAssetManager.modelDirectory)
+        let backend = selectedInferenceBackend
+        let modelDirectory = modelAssetManager.modelDirectory
+        let synthesizer: any SupertonicSynthesizing
+        do {
+            synthesizer = try SupertonicONNXSynthesizer(modelDirectory: modelDirectory, inferenceBackend: backend)
+        } catch {
+            guard backend == .coreMLGPU else { throw error }
+            logger.error("Core ML GPU initialization failed; falling back to CPU: \(error.localizedDescription)")
+            synthesizer = try SupertonicONNXSynthesizer(modelDirectory: modelDirectory, inferenceBackend: .cpu)
+        }
         self.synthesizer = synthesizer
         return synthesizer
     }
@@ -715,6 +790,7 @@ private struct SupertonicSettingsView: View {
     @State private var selectedVoiceId = "M1"
     @State private var speed = 1.05
     @State private var quality: SupertonicQuality = .balanced
+    @State private var useCoreMLGPU = false
     @State private var modelState: SupertonicModelState = .notDownloaded
     @State private var progress = 0.0
     @State private var readAloudShortcut: SupertonicShortcut?
@@ -746,6 +822,10 @@ private struct SupertonicSettingsView: View {
             Divider()
 
             voiceSection
+
+            Divider()
+
+            inferenceSection
 
             Divider()
 
@@ -883,6 +963,25 @@ private struct SupertonicSettingsView: View {
         }
     }
 
+    private var inferenceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Inference", bundle: bundle)
+                .font(.subheadline)
+                .fontWeight(.medium)
+
+            Toggle(isOn: $useCoreMLGPU) {
+                Text("Use Mac GPU (Core ML)", bundle: bundle)
+            }
+            .onChange(of: useCoreMLGPU) { _, newValue in
+                plugin.setInferenceBackend(newValue ? .coreMLGPU : .cpu)
+            }
+
+            Text("Attempts ONNX inference through Core ML on the Mac GPU. If Core ML cannot load the model, speech falls back to CPU.", bundle: bundle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private var shortcutSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Read Selection Shortcut", bundle: bundle)
@@ -996,6 +1095,7 @@ private struct SupertonicSettingsView: View {
         selectedVoiceId = plugin.selectedVoiceId ?? "M1"
         speed = plugin.selectedSpeed
         quality = plugin.selectedQuality
+        useCoreMLGPU = plugin.selectedInferenceBackend == .coreMLGPU
         modelState = plugin.modelState
         progress = plugin.modelDownloadProgress
         readAloudShortcut = plugin.selectedReadAloudShortcut

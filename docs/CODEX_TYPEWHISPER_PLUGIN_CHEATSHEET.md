@@ -214,9 +214,9 @@ docs/screenshots/settings.png
 Commit changes, then tag and push:
 
 ```sh
-git tag -a v1.0.0 -m "Supertonic Read Selection v1.0.0"
+git tag -a vX.Y.Z -m "Supertonic Read Selection vX.Y.Z"
 git push origin main
-git push origin v1.0.0
+git push origin vX.Y.Z
 ```
 
 The release workflow builds on macOS and attaches:
@@ -234,4 +234,3 @@ git tag -a v1.0.0 -m "Supertonic Read Selection v1.0.0"
 
 If the tag has already been pushed, be careful: moving published tags can
 confuse users and release automation.
-

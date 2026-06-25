@@ -1,16 +1,36 @@
 import Foundation
 import OnnxRuntimeBindings
+import os
 
-final class SupertonicONNXSynthesizer: SupertonicSynthesizing, @unchecked Sendable {
+private let supertonicRuntimeLogger = Logger(
+    subsystem: "com.sebk4c.typewhisper.tts.supertonic-read-selection",
+    category: "Runtime"
+)
+
+final class SupertonicONNXSynthesizer: SupertonicStreamingSynthesizing, @unchecked Sendable {
     private let textToSpeech: SupertonicTextToSpeech
     private let voiceStylesDirectory: URL
+    private let inferenceBackend: SupertonicInferenceBackend
     private let inferenceLock = NSLock()
 
-    init(modelDirectory: URL) throws {
+    var sampleRate: Int { textToSpeech.sampleRate }
+
+    init(modelDirectory: URL, inferenceBackend: SupertonicInferenceBackend = .cpu) throws {
+        let startedAt = Date()
+        supertonicRuntimeLogger.info("Initializing Supertonic ONNX runtime with backend=\(inferenceBackend.rawValue, privacy: .public)")
+
         let onnxDirectory = modelDirectory.appendingPathComponent("onnx", isDirectory: true)
         let environment = try ORTEnv(loggingLevel: .warning)
-        self.textToSpeech = try SupertonicTextToSpeech.load(onnxDirectory: onnxDirectory, environment: environment)
+        self.textToSpeech = try SupertonicTextToSpeech.load(
+            onnxDirectory: onnxDirectory,
+            environment: environment,
+            inferenceBackend: inferenceBackend
+        )
         self.voiceStylesDirectory = modelDirectory.appendingPathComponent("voice_styles", isDirectory: true)
+        self.inferenceBackend = inferenceBackend
+
+        let elapsed = String(format: "%.3f", Date().timeIntervalSince(startedAt))
+        supertonicRuntimeLogger.info("Initialized Supertonic ONNX runtime with backend=\(inferenceBackend.rawValue, privacy: .public) elapsed=\(elapsed, privacy: .public)s")
     }
 
     func synthesize(
@@ -27,6 +47,7 @@ final class SupertonicONNXSynthesizer: SupertonicSynthesizing, @unchecked Sendab
         inferenceLock.lock()
         defer { inferenceLock.unlock() }
 
+        let startedAt = Date()
         let result = try textToSpeech.call(
             text,
             language,
@@ -35,7 +56,41 @@ final class SupertonicONNXSynthesizer: SupertonicSynthesizing, @unchecked Sendab
             speed: Float(speed),
             silenceDuration: 0.3
         )
+        let elapsed = String(format: "%.3f", Date().timeIntervalSince(startedAt))
+        supertonicRuntimeLogger.info("Completed Supertonic synthesis with backend=\(self.inferenceBackend.rawValue, privacy: .public) quality=\(quality.rawValue, privacy: .public) samples=\(result.wav.count, privacy: .public) elapsed=\(elapsed, privacy: .public)s")
         return SupertonicSynthesisOutput(samples: result.wav, sampleRate: textToSpeech.sampleRate)
+    }
+
+    func synthesizeStreaming(
+        text: String,
+        language: String,
+        voiceId: String,
+        quality: SupertonicQuality,
+        speed: Double,
+        onAudio: @escaping @Sendable ([Float]) -> Bool
+    ) throws {
+        let style = try SupertonicStyle.load(
+            from: voiceStylesDirectory.appendingPathComponent("\(voiceId).json")
+        )
+
+        inferenceLock.lock()
+        defer { inferenceLock.unlock() }
+
+        let startedAt = Date()
+        var emittedSamples = 0
+        try textToSpeech.streamCall(
+            text,
+            language,
+            style,
+            quality.totalSteps,
+            speed: Float(speed),
+            silenceDuration: 0.3
+        ) { samples in
+            emittedSamples += samples.count
+            return onAudio(samples)
+        }
+        let elapsed = String(format: "%.3f", Date().timeIntervalSince(startedAt))
+        supertonicRuntimeLogger.info("Completed streaming Supertonic synthesis with backend=\(self.inferenceBackend.rawValue, privacy: .public) quality=\(quality.rawValue, privacy: .public) samples=\(emittedSamples, privacy: .public) elapsed=\(elapsed, privacy: .public)s")
     }
 }
 
@@ -109,6 +164,10 @@ private final class SupertonicUnicodeProcessor {
 private struct SupertonicStyle {
     let ttl: ORTValue
     let dp: ORTValue
+    private let ttlValues: [Float]
+    private let ttlDims: [Int]
+    private let dpValues: [Float]
+    private let dpDims: [Int]
 
     static func load(from url: URL) throws -> SupertonicStyle {
         let data = try Data(contentsOf: url)
@@ -129,7 +188,68 @@ private struct SupertonicStyle {
 
         return SupertonicStyle(
             ttl: try SupertonicORT.tensor(values: ttlFlat, elementType: .float, shape: ttlShape),
-            dp: try SupertonicORT.tensor(values: dpFlat, elementType: .float, shape: dpShape)
+            dp: try SupertonicORT.tensor(values: dpFlat, elementType: .float, shape: dpShape),
+            ttlValues: ttlFlat,
+            ttlDims: ttlDims,
+            dpValues: dpFlat,
+            dpDims: dpDims
+        )
+    }
+
+    func ttlValue(batchSize: Int) throws -> ORTValue {
+        try batchedValue(
+            cachedValue: ttl,
+            values: ttlValues,
+            dims: ttlDims,
+            batchSize: batchSize
+        )
+    }
+
+    func dpValue(batchSize: Int) throws -> ORTValue {
+        try batchedValue(
+            cachedValue: dp,
+            values: dpValues,
+            dims: dpDims,
+            batchSize: batchSize
+        )
+    }
+
+    private func batchedValue(
+        cachedValue: ORTValue,
+        values: [Float],
+        dims: [Int],
+        batchSize: Int
+    ) throws -> ORTValue {
+        guard batchSize > 1 else { return cachedValue }
+        guard dims.first == 1 else {
+            if dims.first == batchSize {
+                return try SupertonicORT.tensor(
+                    values: values,
+                    elementType: .float,
+                    shape: dims.map { NSNumber(value: $0) }
+                )
+            }
+            throw SupertonicPluginError.invalidDownloadResponse
+        }
+
+        let valuesPerBatch = dims.dropFirst().reduce(1, *)
+        guard valuesPerBatch > 0, values.count >= valuesPerBatch else {
+            throw SupertonicPluginError.invalidDownloadResponse
+        }
+
+        let source = Array(values.prefix(valuesPerBatch))
+        var repeatedValues: [Float] = []
+        repeatedValues.reserveCapacity(valuesPerBatch * batchSize)
+        for _ in 0..<batchSize {
+            repeatedValues.append(contentsOf: source)
+        }
+
+        var batchedDims = dims
+        batchedDims[0] = batchSize
+        return try SupertonicORT.tensor(
+            values: repeatedValues,
+            elementType: .float,
+            shape: batchedDims.map { NSNumber(value: $0) }
         )
     }
 }
@@ -143,6 +263,7 @@ private final class SupertonicTextToSpeech {
     private let textEncoder: ORTSession
     private let vectorEstimator: ORTSession
     private let vocoder: ORTSession
+    private let inferenceBatchSize = 4
 
     init(
         config: SupertonicConfig,
@@ -161,37 +282,73 @@ private final class SupertonicTextToSpeech {
         self.sampleRate = config.ae.sampleRate
     }
 
-    static func load(onnxDirectory: URL, environment: ORTEnv) throws -> SupertonicTextToSpeech {
+    static func load(
+        onnxDirectory: URL,
+        environment: ORTEnv,
+        inferenceBackend: SupertonicInferenceBackend
+    ) throws -> SupertonicTextToSpeech {
+        let startedAt = Date()
         let configData = try Data(contentsOf: onnxDirectory.appendingPathComponent("tts.json"))
         let config = try JSONDecoder().decode(SupertonicConfig.self, from: configData)
-        let sessionOptions = try ORTSessionOptions()
+        let sessionOptions = try makeSessionOptions(
+            for: inferenceBackend,
+            modelDirectory: onnxDirectory.deletingLastPathComponent()
+        )
 
-        return try SupertonicTextToSpeech(
+        let durationPredictor = try ORTSession(
+            env: environment,
+            modelPath: onnxDirectory.appendingPathComponent("duration_predictor.onnx").path,
+            sessionOptions: sessionOptions
+        )
+        let textEncoder = try ORTSession(
+            env: environment,
+            modelPath: onnxDirectory.appendingPathComponent("text_encoder.onnx").path,
+            sessionOptions: sessionOptions
+        )
+        let vectorEstimator = try ORTSession(
+            env: environment,
+            modelPath: onnxDirectory.appendingPathComponent("vector_estimator.onnx").path,
+            sessionOptions: sessionOptions
+        )
+        let vocoder = try ORTSession(
+            env: environment,
+            modelPath: onnxDirectory.appendingPathComponent("vocoder.onnx").path,
+            sessionOptions: sessionOptions
+        )
+
+        let elapsed = String(format: "%.3f", Date().timeIntervalSince(startedAt))
+        supertonicRuntimeLogger.info("Created Supertonic ONNX sessions with backend=\(inferenceBackend.rawValue, privacy: .public) elapsed=\(elapsed, privacy: .public)s")
+
+        return SupertonicTextToSpeech(
             config: config,
-            textProcessor: SupertonicUnicodeProcessor(
+            textProcessor: try SupertonicUnicodeProcessor(
                 indexerPath: onnxDirectory.appendingPathComponent("unicode_indexer.json")
             ),
-            durationPredictor: ORTSession(
-                env: environment,
-                modelPath: onnxDirectory.appendingPathComponent("duration_predictor.onnx").path,
-                sessionOptions: sessionOptions
-            ),
-            textEncoder: ORTSession(
-                env: environment,
-                modelPath: onnxDirectory.appendingPathComponent("text_encoder.onnx").path,
-                sessionOptions: sessionOptions
-            ),
-            vectorEstimator: ORTSession(
-                env: environment,
-                modelPath: onnxDirectory.appendingPathComponent("vector_estimator.onnx").path,
-                sessionOptions: sessionOptions
-            ),
-            vocoder: ORTSession(
-                env: environment,
-                modelPath: onnxDirectory.appendingPathComponent("vocoder.onnx").path,
-                sessionOptions: sessionOptions
-            )
+            durationPredictor: durationPredictor,
+            textEncoder: textEncoder,
+            vectorEstimator: vectorEstimator,
+            vocoder: vocoder
         )
+    }
+
+    private static func makeSessionOptions(
+        for inferenceBackend: SupertonicInferenceBackend,
+        modelDirectory: URL
+    ) throws -> ORTSessionOptions {
+        let sessionOptions = try ORTSessionOptions()
+        guard inferenceBackend == .coreMLGPU else { return sessionOptions }
+
+        let cacheDirectory = modelDirectory.appendingPathComponent("coreml-cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        supertonicRuntimeLogger.info("Configuring ONNX Runtime Core ML provider available=\(ORTIsCoreMLExecutionProviderAvailable(), privacy: .public) modelFormat=NeuralNetwork computeUnits=CPUAndGPU cacheEnabled=true")
+        try sessionOptions.appendExecutionProvider("CoreML", providerOptions: [
+            "ModelFormat": "NeuralNetwork",
+            "MLComputeUnits": "CPUAndGPU",
+            "RequireStaticInputShapes": "0",
+            "EnableOnSubgraphs": "0",
+            "ModelCacheDirectory": cacheDirectory.path,
+        ])
+        return sessionOptions
     }
 
     func call(
@@ -202,30 +359,164 @@ private final class SupertonicTextToSpeech {
         speed: Float = 1.05,
         silenceDuration: Float = 0.3
     ) throws -> (wav: [Float], duration: Float) {
-        let chunkLength = (language == "ko" || language == "ja") ? 120 : 300
-        let chunks = supertonicChunkText(text, maxLength: chunkLength)
-        let languageList = Array(repeating: language, count: chunks.count)
-
         var combinedWav: [Float] = []
         var combinedDuration: Float = 0
-
-        for (index, chunk) in chunks.enumerated() {
-            let result = try infer([chunk], [languageList[index]], style, totalSteps, speed: speed)
-            let duration = result.duration[0]
-            let wavLength = min(Int(Float(sampleRate) * duration), result.wav.count)
-            let wavChunk = Array(result.wav.prefix(wavLength))
-
-            if index > 0 {
-                let silenceLength = Int(silenceDuration * Float(sampleRate))
-                combinedWav.append(contentsOf: [Float](repeating: 0, count: silenceLength))
-                combinedDuration += silenceDuration
-            }
-
-            combinedWav.append(contentsOf: wavChunk)
+        try processChunks(
+            text,
+            language,
+            style,
+            totalSteps,
+            speed: speed,
+            silenceDuration: silenceDuration,
+            prioritizeFirstUtterance: false
+        ) { samples, duration in
+            combinedWav.append(contentsOf: samples)
             combinedDuration += duration
+            return true
+        }
+        return (combinedWav, combinedDuration)
+    }
+
+    func streamCall(
+        _ text: String,
+        _ language: String,
+        _ style: SupertonicStyle,
+        _ totalSteps: Int,
+        speed: Float = 1.05,
+        silenceDuration: Float = 0.3,
+        onAudio: @escaping ([Float]) -> Bool
+    ) throws {
+        try processChunks(
+            text,
+            language,
+            style,
+            totalSteps,
+            speed: speed,
+            silenceDuration: silenceDuration,
+            prioritizeFirstUtterance: true
+        ) { samples, _ in
+            onAudio(samples)
+        }
+    }
+
+    private func processChunks(
+        _ text: String,
+        _ language: String,
+        _ style: SupertonicStyle,
+        _ totalSteps: Int,
+        speed: Float,
+        silenceDuration: Float,
+        prioritizeFirstUtterance: Bool,
+        onAudio: ([Float], Float) throws -> Bool
+    ) throws {
+        let chunkLength = (language == "ko" || language == "ja") ? 120 : 300
+        let baseChunks = supertonicChunkText(text, maxLength: chunkLength)
+        let chunks = prioritizeFirstUtterance
+            ? supertonicPromoteFirstUtterance(baseChunks, maxLength: chunkLength)
+            : baseChunks
+        let languageList = Array(repeating: language, count: chunks.count)
+        let batchSize = max(1, min(inferenceBatchSize, chunks.count))
+        let firstBatchSize = prioritizeFirstUtterance && chunks.count > 1 ? 1 : batchSize
+        supertonicRuntimeLogger.info("Processing Supertonic chunks count=\(chunks.count, privacy: .public) batchSize=\(batchSize, privacy: .public) firstBatchSize=\(firstBatchSize, privacy: .public)")
+        if prioritizeFirstUtterance {
+            supertonicRuntimeLogger.info("Prioritizing first Supertonic utterance chars=\(chunks[0].count, privacy: .public)")
         }
 
-        return (combinedWav, combinedDuration)
+        let startedAt = Date()
+        var emittedAnyAudio = false
+        var emittedChunkCount = 0
+
+        func emit(wavChunk: [Float], duration: Float) throws -> Bool {
+            var samples: [Float] = []
+            var emittedDuration = duration
+            if emittedAnyAudio {
+                let silenceLength = Int(silenceDuration * Float(sampleRate))
+                samples.append(contentsOf: [Float](repeating: 0, count: silenceLength))
+                emittedDuration += silenceDuration
+            }
+            samples.append(contentsOf: wavChunk)
+            emittedAnyAudio = true
+            emittedChunkCount += 1
+
+            let elapsed = String(format: "%.3f", Date().timeIntervalSince(startedAt))
+            supertonicRuntimeLogger.info("Emitting Supertonic audio chunk index=\(emittedChunkCount, privacy: .public) samples=\(samples.count, privacy: .public) elapsed=\(elapsed, privacy: .public)s")
+            return try onAudio(samples, emittedDuration)
+        }
+
+        func processBatch(start: Int, end: Int) throws -> Bool {
+            let batchChunks = Array(chunks[start..<end])
+            let batchLanguages = Array(languageList[start..<end])
+            do {
+                let result = try infer(batchChunks, batchLanguages, style, totalSteps, speed: speed)
+                let wavChunks = try splitBatchedWav(
+                    result.wav,
+                    shape: result.wavShape,
+                    batchSize: batchChunks.count,
+                    durations: result.duration
+                )
+                for index in wavChunks.indices {
+                    guard try emit(wavChunk: wavChunks[index], duration: result.duration[index]) else { return false }
+                }
+            } catch {
+                guard batchChunks.count > 1 else { throw error }
+                supertonicRuntimeLogger.error("Batched Supertonic inference failed for batchSize=\(batchChunks.count, privacy: .public); falling back to sequential chunks: \(error.localizedDescription)")
+                for index in batchChunks.indices {
+                    let result = try infer([batchChunks[index]], [batchLanguages[index]], style, totalSteps, speed: speed)
+                    let wavChunks = try splitBatchedWav(
+                        result.wav,
+                        shape: result.wavShape,
+                        batchSize: 1,
+                        durations: result.duration
+                    )
+                    guard try emit(wavChunk: wavChunks[0], duration: result.duration[0]) else { return false }
+                }
+            }
+            return true
+        }
+
+        var batchStart = 0
+        if prioritizeFirstUtterance, chunks.count > 1 {
+            guard try processBatch(start: 0, end: 1) else { return }
+            batchStart = 1
+        }
+
+        while batchStart < chunks.count {
+            let batchEnd = min(batchStart + batchSize, chunks.count)
+            guard try processBatch(start: batchStart, end: batchEnd) else { return }
+            batchStart = batchEnd
+        }
+    }
+
+    private func splitBatchedWav(
+        _ wav: [Float],
+        shape: [Int],
+        batchSize: Int,
+        durations: [Float]
+    ) throws -> [[Float]] {
+        guard batchSize > 0, durations.count >= batchSize else {
+            throw SupertonicPluginError.invalidDownloadResponse
+        }
+
+        if batchSize == 1 {
+            let wavLength = min(max(0, Int(Float(sampleRate) * durations[0])), wav.count)
+            return [Array(wav.prefix(wavLength))]
+        }
+
+        guard shape.first == batchSize else {
+            throw SupertonicPluginError.invalidDownloadResponse
+        }
+
+        let samplesPerBatchItem = shape.dropFirst().reduce(1, *)
+        guard samplesPerBatchItem > 0,
+              wav.count >= samplesPerBatchItem * batchSize else {
+            throw SupertonicPluginError.invalidDownloadResponse
+        }
+
+        return (0..<batchSize).map { index in
+            let startIndex = index * samplesPerBatchItem
+            let wavLength = min(max(0, Int(Float(sampleRate) * durations[index])), samplesPerBatchItem)
+            return Array(wav[startIndex..<(startIndex + wavLength)])
+        }
     }
 
     private func infer(
@@ -234,9 +525,11 @@ private final class SupertonicTextToSpeech {
         _ style: SupertonicStyle,
         _ totalSteps: Int,
         speed: Float
-    ) throws -> (wav: [Float], duration: [Float]) {
+    ) throws -> (wav: [Float], wavShape: [Int], duration: [Float]) {
         let batchSize = textList.count
         let (textIds, textMask) = textProcessor.call(textList, languageList)
+        let styleDP = try style.dpValue(batchSize: batchSize)
+        let styleTTL = try style.ttlValue(batchSize: batchSize)
 
         let textIdsFlat = textIds.flatMap { $0 }
         let textMaskFlat = textMask.flatMap { $0.flatMap { $0 } }
@@ -253,7 +546,7 @@ private final class SupertonicTextToSpeech {
         )
 
         let durationOutputs = try durationPredictor.run(
-            withInputs: ["text_ids": textIdsValue, "style_dp": style.dp, "text_mask": textMaskValue],
+            withInputs: ["text_ids": textIdsValue, "style_dp": styleDP, "text_mask": textMaskValue],
             outputNames: ["duration"],
             runOptions: nil
         )
@@ -266,7 +559,7 @@ private final class SupertonicTextToSpeech {
         }
 
         let textEncoderOutputs = try textEncoder.run(
-            withInputs: ["text_ids": textIdsValue, "style_ttl": style.ttl, "text_mask": textMaskValue],
+            withInputs: ["text_ids": textIdsValue, "style_ttl": styleTTL, "text_mask": textMaskValue],
             outputNames: ["text_emb"],
             runOptions: nil
         )
@@ -313,7 +606,7 @@ private final class SupertonicTextToSpeech {
                 withInputs: [
                     "noisy_latent": latentValue,
                     "text_emb": textEmbeddings,
-                    "style_ttl": style.ttl,
+                    "style_ttl": styleTTL,
                     "latent_mask": latentMaskValue,
                     "text_mask": textMaskValue,
                     "current_step": currentStepValue,
@@ -351,7 +644,11 @@ private final class SupertonicTextToSpeech {
             throw SupertonicPluginError.invalidDownloadResponse
         }
 
-        return (try SupertonicORT.floatArray(from: wavValue), duration)
+        return (
+            try SupertonicORT.floatArray(from: wavValue),
+            try SupertonicORT.tensorShape(from: wavValue),
+            duration
+        )
     }
 }
 
@@ -373,6 +670,10 @@ private enum SupertonicORT {
         return data.withUnsafeBytes { pointer in
             Array(pointer.bindMemory(to: Float.self))
         }
+    }
+
+    static func tensorShape(from value: ORTValue) throws -> [Int] {
+        try value.tensorTypeAndShapeInfo().shape.map { $0.intValue }
     }
 
     static func reshape3D(
@@ -544,6 +845,7 @@ private func supertonicSampleNoisyLatent(
 }
 
 private let supertonicMaxChunkLength = 300
+private let supertonicFirstUtteranceMaxLength = 160
 private let supertonicAbbreviations: Set<String> = [
     "Dr.", "Mr.", "Mrs.", "Ms.", "Prof.", "Sr.", "Jr.",
     "St.", "Ave.", "Rd.", "Blvd.", "Dept.", "Inc.", "Ltd.",
@@ -606,6 +908,41 @@ private func supertonicChunkText(_ text: String, maxLength: Int = 0) -> [String]
     }
 
     return chunks.isEmpty ? [""] : chunks
+}
+
+private func supertonicPromoteFirstUtterance(_ chunks: [String], maxLength: Int) -> [String] {
+    guard let firstChunk = chunks.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !firstChunk.isEmpty else {
+        return chunks
+    }
+
+    let firstChunkSentences = supertonicSplitSentences(firstChunk)
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    guard let firstSentence = firstChunkSentences.first else {
+        return chunks
+    }
+
+    let firstUtteranceMaxLength = min(maxLength, supertonicFirstUtteranceMaxLength)
+    let firstSentenceParts = firstSentence.count > firstUtteranceMaxLength
+        ? supertonicSplitLongText(firstSentence, maxLength: firstUtteranceMaxLength)
+        : [firstSentence]
+    guard let firstUtterance = firstSentenceParts.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !firstUtterance.isEmpty else {
+        return chunks
+    }
+
+    let remainingFirstChunkParts = Array(firstSentenceParts.dropFirst()) + Array(firstChunkSentences.dropFirst())
+    let remainingFirstChunk = remainingFirstChunkParts
+        .joined(separator: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    var prioritizedChunks = [firstUtterance]
+    if !remainingFirstChunk.isEmpty {
+        prioritizedChunks.append(contentsOf: supertonicChunkText(remainingFirstChunk, maxLength: maxLength))
+    }
+    prioritizedChunks.append(contentsOf: chunks.dropFirst())
+    return prioritizedChunks
 }
 
 private func supertonicSplitLongText(_ text: String, maxLength: Int) -> [String] {

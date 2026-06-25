@@ -76,7 +76,7 @@ final class SupertonicPluginTests: XCTestCase {
         XCTAssertFalse(plugin.canDownloadModel)
     }
 
-    func testSelectVoiceSpeedAndQualityPersistChoices() throws {
+    func testSelectVoiceSpeedQualityAndInferenceBackendPersistChoices() throws {
         let host = try PluginTestHostServices()
         let plugin = SupertonicPlugin()
         plugin.activate(host: host)
@@ -84,13 +84,24 @@ final class SupertonicPluginTests: XCTestCase {
         plugin.selectVoice("F1")
         plugin.setSpeed(1.35)
         plugin.setQuality(.high)
+        plugin.setInferenceBackend(.coreMLGPU)
 
         XCTAssertEqual(plugin.selectedVoiceId, "F1")
         XCTAssertEqual(plugin.selectedSpeed, 1.35, accuracy: 0.001)
         XCTAssertEqual(plugin.selectedQuality, .high)
+        XCTAssertEqual(plugin.selectedInferenceBackend, .coreMLGPU)
         XCTAssertEqual(host.userDefault(forKey: "selectedVoiceId") as? String, "F1")
         XCTAssertEqual(host.userDefault(forKey: "speed") as? Double, 1.35)
         XCTAssertEqual(host.userDefault(forKey: "quality") as? String, "high")
+        XCTAssertEqual(host.userDefault(forKey: "inferenceBackend") as? String, "coreMLGPU")
+    }
+
+    func testInferenceBackendDefaultsToCPU() throws {
+        let host = try PluginTestHostServices()
+        let plugin = SupertonicPlugin()
+        plugin.activate(host: host)
+
+        XCTAssertEqual(plugin.selectedInferenceBackend, .cpu)
     }
 
     func testLanguageNormalizationFallsBackToEnglish() {
